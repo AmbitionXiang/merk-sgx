@@ -31,6 +31,7 @@ extern crate serde_derive;
 extern crate lazy_static; 
 use serde_derive::{Deserialize, Serialize};
 
+
 use sgx_tcrypto::*;
 use sgx_types::*;
 use std::boxed::Box;
@@ -41,6 +42,8 @@ use std::sync::{atomic::Ordering, Arc, SgxRwLock as RwLock, SgxMutex as Mutex};
 use std::time::Instant;
 use std::untrusted::time::InstantEx;
 use std::vec::Vec;
+use decoder::*;
+use hash::*;
 
 pub type Bytes = Vec<u8>;
 pub type Hash = [u8; 20];
@@ -127,6 +130,114 @@ pub enum Op {
     Delete,
 }
 
+
+pub fn verify(
+    bytes: &[u8],
+    keys: &[Bytes],
+    expected_hash: Hash
+) -> Result<Vec<Option<Bytes>>> {
+    // TODO: enforce a maximum proof size
+
+    let mut stack: Vec<Bytes> = Vec::with_capacity(32);
+    let mut output = Vec::with_capacity(keys.len());
+
+    let mut key_index = 0;
+    let mut last_push = None;
+
+    fn try_pop(stack: &mut Vec<Bytes>) -> Result<Bytes> {
+        match stack.pop() {
+            None => bail!("Stack underflow"),
+            Some(node) => Ok(node)
+        }
+    };
+
+    for op in Decoder::new(bytes) {
+        match op? {
+            Op::Parent => {
+                let (mut parent, child) = (
+                    try_pop(&mut stack)?,
+                    try_pop(&mut stack)?
+                );
+                parent.attach(true, child)?;
+                stack.push(parent);
+            },
+            Op::Child => {
+                let (child, mut parent) = (
+                    try_pop(&mut stack)?,
+                    try_pop(&mut stack)?
+                );
+                parent.attach(false, child)?;
+                stack.push(parent);
+            },
+            Op::Push(node) => {
+                let node_clone = node.clone();
+                let tree: Tree = node.into();
+                stack.push(tree);
+
+                if let Node::KV(key, value) = &node_clone {
+                    // keys should always be increasing
+                    if let Some(Node::KV(last_key, _)) = &last_push {
+                        if key <= last_key {
+                            bail!("Incorrect key ordering");
+                        }
+                    }
+
+                    loop {
+                        if key_index >= keys.len() || *key < keys[key_index] {
+                            break;
+                        } else if key == &keys[key_index] {
+                            // KV for queried key
+                            output.push(Some(value.clone()));
+                        } else if *key > keys[key_index] {
+                            match &last_push {
+                                None | Some(Node::KV(_, _)) => {
+                                    // previous push was a boundary (global edge or lower key),
+                                    // so this is a valid absence proof
+                                    output.push(None);
+                                },
+                                // proof is incorrect since it skipped queried keys
+                                _ => bail!("Proof incorrectly formed")
+                            }
+                        }
+
+                        key_index += 1;
+                    }
+                }
+
+                last_push = Some(node_clone);
+            }
+        }
+    }
+
+    // absence proofs for right edge
+    if key_index < keys.len() {
+        if let Some(Node::KV(_, _)) = last_push {
+            for _ in 0..(keys.len() - key_index) {
+                output.push(None);
+            }
+        } else {
+            bail!("Proof incorrectly formed");
+        }
+    } else {
+        debug_assert_eq!(keys.len(), output.len());
+    }
+
+    if stack.len() != 1 {
+        bail!("Expected proof to result in exactly one stack item");
+    }
+
+    let root = stack.pop().unwrap();
+    let hash = root.into_hash().hash();
+    if hash != expected_hash {
+        bail!(
+            "Proof did not match expected hash\n\tExpected: {:?}\n\tActual: {:?}",
+            expected_hash, hash
+        );
+    }
+
+    Ok(output)
+}
+
 struct InTee {
     rootHash: Option<Hash>,
     cache: HashMap<KeyType, ValueType>,
@@ -140,15 +251,25 @@ impl InTee {
         }
     }
 
-    pub fn update(&mut self, key: &KeyType, op: Op, newRootHash: &Hash, oldProof: Vec<u8>, newProof: Vec<u8>) -> Result<(), &'static str> {
-        Ok(())
+    pub fn resetRootHash(rootHash: &Hash) {
+        self.rootHash = rootHash;
+        cache = HashMap::new();
     }
 
-    fn verify() -> Result<bool, &'static str>{
-        Ok(true)
+    pub fn update(&mut self, key: &KeyType, op: Op, newRootHash: &Hash, newProof: Vec<u8>) -> Result<(), &'static str> {
+        // verify_proof()
+        self.resetRootHash(newRootHash);
+        if op == Op::Delete {
+            return;
+        }
+        let mut newValue = verify_proof(newProof.as_slice(), &[key.clone()], newRootHash).unwrap()[0];
+        self.cache.insert(key, newValue);
     }
 
-    pub fn get(&self, key: &KeyType, nonce: &Bytes) -> Option<(ValueType, Sig)>{
+    pub fn get(&self, rootHash: &Hash, key: &KeyType, nonce: &Bytes) -> Option<(ValueType, Sig)>{
+        if rootHash != self.rootHash {
+            return None;
+        }
         match self.cache.get(key) {
             Some(value) => Some((value.to_vec(), self.sign(value.to_vec(), nonce).signature)),
             None => None
@@ -207,8 +328,8 @@ pub extern "C" fn ecall_update(key_ptr: *mut u8, key_len: usize,
         0 => Op::Put(value.clone()),  //check
         1 => Op::Delete,
     };
-    Box::into_raw(value); 
-    let res = INTEE.update(key, op, newRootHash, oproof.to_vec(), nproof.to_vec());
+    Box::into_raw(value);
+    let res = INTEE.update(key, op, newRootHash, nproof.to_vec());
     match res {
         Ok(()) => 1,
         _ => 0,
