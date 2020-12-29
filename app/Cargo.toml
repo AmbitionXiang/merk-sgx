@@ -8,6 +8,7 @@ build = "build.rs"
 [dependencies]
 failure = "0.1.6"
 merk = "1.0.1"
+sgx_tcrypto = { git = "https://github.com/apache/teaclave-sgx-sdk.git" }
 sgx_types = { git = "https://github.com/apache/teaclave-sgx-sdk.git" }
 sgx_urts = { git = "https://github.com/apache/teaclave-sgx-sdk.git" }
 

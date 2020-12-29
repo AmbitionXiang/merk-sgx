@@ -20,14 +20,20 @@ enclave {
     from "sgx_stdio.edl" import *;
     from "sgx_backtrace.edl" import *;
     from "sgx_tstdc.edl" import *;
-    
+
+    struct sgx_ec256_signature_t {
+        uint32_t x[8];
+        uint32_t y[8];
+    };
+
     trusted {
         /* define ECALLs here. */
+
 
         public uint8_t ecall_get([in, count=key_len] uint8_t* key_ptr, size_t key_len, 
                 [in, count=nonce_len] uint8_t* nonce_ptr, size_t nonce_len, 
                 [user_check] uint8_t* value_ptr, [user_check] size_t* value_len,
-                [out] uint8_t bytes[384]); //sgx_rsa3072_signature_t   
+                [out] sgx_ec256_signature_t* sig);  
         public uint8_t ecall_update([in, count=key_len] uint8_t* key_ptr, size_t key_len, 
                 uint8_t op, [in] uint8_t hash[20],
                 [in, count=oproof_len] uint8_t* oproof_ptr, size_t oproof_len,

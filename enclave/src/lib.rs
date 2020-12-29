@@ -44,83 +44,8 @@ use std::vec::Vec;
 
 pub type Bytes = Vec<u8>;
 pub type Hash = [u8; 20];
-pub type Sig = [u8; 384];
 pub type KeyType = Vec<u8>;
 pub type ValueType = Vec<u8>;
-
-/*
-pub struct RsaPrivKey {
-    key: sgx_rsa_key_t,
-    mod_size: i32,
-    exp_size: i32,
-}
-
-impl RsaPrivKey {
-    pub fn new(
-        mod_size: i32,
-        exp_size: i32,
-        e: &[u8],
-        p: &[u8],
-        q: &[u8],
-        dmp1: &[u8],
-        dmq1: &[u8],
-        iqmp: &[u8]) -> Self
-    {
-        let mut key: sgx_rsa_key_t = std::ptr::null_mut(); 
-        let ret = rsgx_create_rsa_priv_key(mod_size,
-                                        exp_size,
-                                        e,
-                                        p,
-                                        q,
-                                        dmp1,
-                                        dmq1,
-                                        iqmp,
-                                        key);
-        match ret {
-            sgx_status_t::SGX_SUCCESS => {
-                RsaPrivKey {
-                    key,
-                    mod_size,
-                    exp_size,
-                }
-            },
-            _ => panic!("generate priv key error"),
-        }
-    }
-}
-
-pub struct RsaPubKey {
-    key: sgx_rsa_key_t,
-    mod_size: i32,
-    exp_size: i32,
-}
-
-impl RsaPubKey {
-    pub fn new( 
-        mod_size: i32,
-        exp_size: i32,
-        n: &[u8],
-        e: &[u8]) -> Self
-    {
-        let mut key: sgx_rsa_key_t = std::ptr::null_mut(); 
-        let ret = rsgx_create_rsa_pub_key(mod_size,
-                                        exp_size,
-                                        n,
-                                        e,
-                                        key);
-        match ret {
-            sgx_status_t::SGX_SUCCESS => {
-                RsaPubKey {
-                    key,
-                    mod_size,
-                    exp_size,
-                }
-            },
-            _ => panic!("generate pub key error"),
-        }
-    }
-}
-*/
 
 pub enum Op {
     Put(Vec<u8>),
@@ -148,45 +73,41 @@ impl InTee {
         Ok(true)
     }
 
-    pub fn get(&self, key: &KeyType, nonce: &Bytes) -> Option<(ValueType, Sig)>{
+    pub fn get(&self, key: &KeyType, nonce: &Bytes) -> Option<(ValueType, sgx_ec256_signature_t)>{
         match self.cache.get(key) {
-            Some(value) => Some((value.to_vec(), self.sign(value.to_vec(), nonce).signature)),
+            Some(value) => Some((value.to_vec(), self.sign(value.to_vec(), nonce))),
             None => None
         }
     }
 
-    fn sign(&self, value: ValueType, nonce: &Bytes) -> sgx_rsa3072_signature_t {
+    fn sign(&self, value: ValueType, nonce: &Bytes) -> sgx_ec256_signature_t {
         let mut data = value;
         data.extend_from_slice(nonce);
-        let result = rsgx_rsa3072_sign_msg(&data, &KEYPAIR.0);
-        match result {
-            Err(x) => panic!("sig error"),
-            Ok(sig) => sig,
-        }
+        ecdsa_sign_slice(&data[..])
     }
 
 }
 
 lazy_static! {
     static ref INTEE: Arc<RwLock<InTee>> = Arc::new(RwLock::new(InTee::new()));
-    static ref KEYPAIR: (SgxRsaPrivKey, SgxRsaPubKey) = build_rsa_key();
+    static ref KEYPAIR: (sgx_ec256_private_t, sgx_ec256_public_t) = build_ecc_key();
 }
 
 #[no_mangle]
 pub extern "C" fn ecall_get(key_ptr: *mut u8, key_len: usize,
                     nonce_ptr: *mut u8, nonce_len: usize,
                     value_ptr: *mut u8, value_len: &mut usize,
-                    bytes: &mut Sig) -> u8
+                    sig: &mut sgx_ec256_signature_t) -> u8
 {
     let key = unsafe { slice::from_raw_parts(key_ptr, key_len) };
     let nonce = unsafe { slice::from_raw_parts(nonce_ptr, nonce_len) };
-    let res = INTEE.get(key, nonce);
+    let res = INTEE.read().unwrap().get(&key.to_vec(), &nonce.to_vec());
     match res {
         Some((v, b)) => {
-            value_len = v.len();
-            let mut value = unsafe { slice::from_raw_parts_mut(value_ptr, value_len) }; 
+            *value_len = v.len();
+            let mut value = unsafe { slice::from_raw_parts_mut(value_ptr, *value_len) }; 
             value.copy_from_slice(v.as_slice());
-            *bytes = b;
+            *sig = b;
             1
         },
         None => 0,
@@ -204,118 +125,48 @@ pub extern "C" fn ecall_update(key_ptr: *mut u8, key_len: usize,
     let nproof = unsafe { slice::from_raw_parts(nproof_ptr, nproof_len) };
     let value = unsafe { Box::from_raw(value as *mut ValueType) };
     let op = match op {
-        0 => Op::Put(value.clone()),  //check
+        0 => Op::Put(*value.clone()),  //check
         1 => Op::Delete,
+        _ => panic!("invalid op num"),
     };
     Box::into_raw(value); 
-    let res = INTEE.update(key, op, newRootHash, oproof.to_vec(), nproof.to_vec());
+    let res = INTEE.write().unwrap().update(&key.to_vec(), op, newRootHash, oproof.to_vec(), nproof.to_vec());
     match res {
         Ok(()) => 1,
         _ => 0,
     }
 }
 
-/*
-pub fn build_rsa_key() -> (SgxPrivKey, RsaPubKey) {
-    let mod_size: i32 = 256;
-    let exp_size: i32 = 4;
-    let mut n: Vec<u8> = vec![0_u8; mod_size as usize];
-    let mut d: Vec<u8> = vec![0_u8; mod_size as usize];
-    let mut e: Vec<u8> = vec![1, 0, 1, 0];
-    let mut p: Vec<u8> = vec![0_u8; mod_size as usize / 2];
-    let mut q: Vec<u8> = vec![0_u8; mod_size as usize / 2];
-    let mut dmp1: Vec<u8> = vec![0_u8; mod_size as usize / 2];
-    let mut dmq1: Vec<u8> = vec![0_u8; mod_size as usize / 2];
-    let mut iqmp: Vec<u8> = vec![0_u8; mod_size as usize / 2];
-
-    let result = rsgx_create_rsa_key_pair(mod_size,
-                                          exp_size,
-                                          n.as_mut_slice(),
-                                          d.as_mut_slice(),
-                                          e.as_mut_slice(),
-                                          p.as_mut_slice(),
-                                          q.as_mut_slice(),
-                                          dmp1.as_mut_slice(),
-                                          dmq1.as_mut_slice(),
-                                          iqmp.as_mut_slice());
-
-    match result {
-        Err(x) => {
-            return x;
-        },
+pub fn build_ecc_key() -> (sgx_ec256_private_t, sgx_ec256_public_t) {
+    let ecc_handle = SgxEccHandle::new();
+    let res = ecc_handle.open();
+    match res {
+        Err(e) => panic!("SgxEccHandle open error"),
         Ok(()) => {},
-    }
-
-    let pub_key = RsaPubKey::new(mod_size,
-                               exp_size,
-                               n.as_slice(),
-                               e.as_slice());
-
-    let priv_key = RsaPrivKey.new(mod_size,
-                                exp_size,
-                                e.as_slice(),
-                                p.as_slice(),
-                                q.as_slice(),
-                                dmp1.as_slice(),
-                                dmq1.as_slice(),
-                                iqmp.as_slice());
-
-    (privkey, pubkey)
+    };
+    let res = ecc_handle.create_key_pair();
+    let (priv_key, pub_key) = match res {
+        Err(e) => panic!("SgxEccHandle create key pair error"),
+        Ok(key) => key,
+    };
+    ecc_handle.close();
+    (priv_key, pub_key) 
 }
-*/
-pub fn build_rsa_key() -> (SgxRsaPrivKey, SgxRsaPubKey) {
-    let mod_size: i32 = 256;
-    let exp_size: i32 = 4;
-    let mut n: Vec<u8> = vec![0_u8; mod_size as usize];
-    let mut d: Vec<u8> = vec![0_u8; mod_size as usize];
-    let mut e: Vec<u8> = vec![1, 0, 1, 0];
-    let mut p: Vec<u8> = vec![0_u8; mod_size as usize / 2];
-    let mut q: Vec<u8> = vec![0_u8; mod_size as usize / 2];
-    let mut dmp1: Vec<u8> = vec![0_u8; mod_size as usize / 2];
-    let mut dmq1: Vec<u8> = vec![0_u8; mod_size as usize / 2];
-    let mut iqmp: Vec<u8> = vec![0_u8; mod_size as usize / 2];
 
-    let result = rsgx_create_rsa_key_pair(mod_size,
-                                        exp_size,
-                                        n.as_mut_slice(),
-                                        d.as_mut_slice(),
-                                        e.as_mut_slice(),
-                                        p.as_mut_slice(),
-                                        q.as_mut_slice(),
-                                        dmp1.as_mut_slice(),
-                                        dmq1.as_mut_slice(),
-                                        iqmp.as_mut_slice());
-
-    match result {
-        Err(x) => {
-            return x;
-        },
-        Ok(()) => {},
-    }
-
-    let privkey = SgxRsaPrivKey::new();
-    let pubkey = SgxRsaPubKey::new();
-
-    let result = pubkey.create(mod_size,
-                            exp_size,
-                            n.as_slice(),
-                            e.as_slice());
-    match result {
-        Err(x) => return x,
+pub fn ecdsa_sign_slice<T>(data: &[T]) -> sgx_ec256_signature_t 
+where T: Copy + sgx_types::marker::ContiguousMemory 
+{
+    let ecc_handle = SgxEccHandle::new();
+    let res = ecc_handle.open();
+    match res {
+        Err(e) => panic!("SgxEccHandle open error"),
         Ok(()) => {},
     };
-
-    let result = privkey.create(mod_size,
-                                exp_size,
-                                e.as_slice(),
-                                p.as_slice(),
-                                q.as_slice(),
-                                dmp1.as_slice(),
-                                dmq1.as_slice(),
-                                iqmp.as_slice());
-    match result {
-        Err(x) => return x,
-        Ok(()) => {},
+    let res = ecc_handle.ecdsa_sign_slice(data, &KEYPAIR.0);
+    let sig = match res {
+        Err(x) => panic!("SgxEccHandle sign error"),
+        Ok(sig) => sig,
     };
-    (privkey, pubkey)
+    ecc_handle.close();
+    sig
 }

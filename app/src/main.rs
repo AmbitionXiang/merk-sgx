@@ -33,7 +33,7 @@ extern "C" {
         key_ptr: *mut u8, key_len: usize,
         nonce_ptr: *mut u8, nonce_len: usize,
         value_ptr: *mut u8, value_len: *mut usize,
-        bytes: &mut Sig,
+        sig: &mut sgx_ec256_signature_t,
     ) -> sgx_status_t;
     pub fn ecall_update(
         eid: sgx_enclave_id_t,
@@ -62,7 +62,6 @@ fn init_enclave() -> SgxResult<SgxEnclave> {
 }
 
 pub type Bytes = Vec<u8>;
-pub type Sig = [u8; 384];
 pub type KeyType = [u8];
 pub type ValueType = Vec<u8>;
 
@@ -74,7 +73,24 @@ pub enum ProofType {
 pub struct ValueWithProof {
     pub proofType: ProofType,
     pub value: Option<ValueType>,
-    pub proof: Bytes // sign of tee or merkle proof
+    pub proof: Option<Bytes>, // sign of tee or merkle proof
+    pub signature: Option<sgx_ec256_signature_t>,
+}
+
+impl ValueWithProof {
+    pub fn new(
+        proofType: ProofType, 
+        value: Option<ValueType>, 
+        proof: Option<Bytes>, 
+        signature: Option<sgx_ec256_signature_t>
+    ) -> Self {
+        ValueWithProof {
+            proofType,
+            value,
+            proof,
+            signature,
+        }
+    }
 }
 
 pub struct CachedMerk {
@@ -126,21 +142,23 @@ impl CachedMerk {
 
     pub fn get_authorized(&self, key: &KeyType, nonce: &Bytes) -> Result<ValueWithProof>{
         if let Some((value, sign)) = self.inTee.get(key, nonce) {
-            return Ok(ValueWithProof {
-                proofType: ProofType::Tee,
-                value: Some(value),
-                proof: sign
-            });
+            return Ok(ValueWithProof::new(
+                ProofType::Tee,
+                Some(value),
+                None,
+                Some(sign),
+            ));
         }
         let merk = self.merk.as_ref().unwrap();
         let value: Option<ValueType> = merk.get(key)?;
         let keyVec = key.to_vec();
-        let proof:Vec<u8> = merk.prove(&[keyVec])?;
-        return Ok(ValueWithProof {
-            proofType: ProofType::Merkle,
-            value: value,
-            proof: proof
-        })
+        let proof: Vec<u8> = merk.prove(&[keyVec])?;
+        return Ok(ValueWithProof::new(
+            ProofType::Merkle,
+            value,
+            Some(proof),
+            None,
+        ))
     }
 }
 
@@ -214,13 +232,13 @@ impl InTee {
         Ok(true)
     }
 
-    pub fn get(&self, key: &KeyType, nonce: &Bytes) -> Option<(ValueType, Bytes)>{
+    pub fn get(&self, key: &KeyType, nonce: &Bytes) -> Option<(ValueType, sgx_ec256_signature_t)>{
         let mut retval: u8 = 0;
         let mut key = key.to_vec();
         let mut nonce = nonce.to_vec();
         let mut len = 1000;
         let mut value = Vec::with_capacity(len); //tmp
-        let mut bytes = [0 as u8; 384]; 
+        let mut sig: sgx_ec256_signature_t = Default::default(); 
 
         let result = unsafe {
             ecall_get(self.enclave.as_ref().unwrap().geteid(),
@@ -231,7 +249,7 @@ impl InTee {
                 nonce.len(),
                 value.as_mut_ptr(),
                 &mut len,
-                &mut bytes,)
+                &mut sig,)
         };
         unsafe {
             println!("len = {:?}", len);
@@ -248,7 +266,7 @@ impl InTee {
         };
         match retval {
             0 => None,
-            1 => Some((value, bytes.to_vec())),
+            1 => Some((value, sig)),
             _ => panic!("return number error"),
         }
     }
