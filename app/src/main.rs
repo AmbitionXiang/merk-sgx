@@ -33,13 +33,13 @@ extern "C" {
         key_ptr: *mut u8, key_len: usize,
         nonce_ptr: *mut u8, nonce_len: usize,
         value_ptr: *mut u8, value_len: *mut usize,
-        sig: &mut sgx_ec256_signature_t,
+        root_hash: &Hash, sig: &mut sgx_ec256_signature_t,
     ) -> sgx_status_t;
     pub fn ecall_update(
         eid: sgx_enclave_id_t,
         retval: *mut u8,
         key_ptr: *mut u8, key_len: usize,
-        op: u8, value: *mut u8, newRootHash: &Hash,
+        op: u8, value: *mut u8, new_root_hash: &Hash,
         oproof_ptr: *mut u8, oproof_len: usize,
         nproof_ptr: *mut u8, nproof_len: usize,
     ) -> sgx_status_t;
@@ -141,7 +141,8 @@ impl CachedMerk {
     }
 
     pub fn get_authorized(&self, key: &KeyType, nonce: &Bytes) -> Result<ValueWithProof>{
-        if let Some((value, sign)) = self.inTee.get(key, nonce) {
+        let merk = self.merk.as_ref().unwrap();
+        if let Some((value, sign)) = self.inTee.get(&merk.root_hash(), key, nonce) {
             return Ok(ValueWithProof::new(
                 ProofType::Tee,
                 Some(value),
@@ -149,7 +150,6 @@ impl CachedMerk {
                 Some(sign),
             ));
         }
-        let merk = self.merk.as_ref().unwrap();
         let value: Option<ValueType> = merk.get(key)?;
         let keyVec = key.to_vec();
         let proof: Vec<u8> = merk.prove(&[keyVec])?;
@@ -232,7 +232,7 @@ impl InTee {
         Ok(true)
     }
 
-    pub fn get(&self, key: &KeyType, nonce: &Bytes) -> Option<(ValueType, sgx_ec256_signature_t)>{
+    pub fn get(&self, rootHash: &Hash, key: &KeyType, nonce: &Bytes) -> Option<(ValueType, sgx_ec256_signature_t)>{
         let mut retval: u8 = 0;
         let mut key = key.to_vec();
         let mut nonce = nonce.to_vec();
@@ -249,6 +249,7 @@ impl InTee {
                 nonce.len(),
                 value.as_mut_ptr(),
                 &mut len,
+                rootHash,
                 &mut sig,)
         };
         unsafe {

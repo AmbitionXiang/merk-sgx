@@ -42,8 +42,11 @@ use std::time::Instant;
 use std::untrusted::time::InstantEx;
 use std::vec::Vec;
 
-pub type Bytes = Vec<u8>;
-pub type Hash = [u8; 20];
+mod decoder;
+use decoder::{verify_proof, };
+mod hash;
+use hash::{Hash, };
+
 pub type KeyType = Vec<u8>;
 pub type ValueType = Vec<u8>;
 
@@ -65,22 +68,35 @@ impl InTee {
         }
     }
 
-    pub fn update(&mut self, key: &KeyType, op: Op, newRootHash: &Hash, oldProof: Vec<u8>, newProof: Vec<u8>) -> Result<(), &'static str> {
+    pub fn resetRootHash(&mut self, rootHash: Hash) {
+        self.rootHash.replace(rootHash);
+        self.cache.clear();
+    }
+
+    pub fn update(&mut self, key: &KeyType, op: Op, newRootHash: Hash, newProof: Vec<u8>) -> Result<(), &'static str> {
+        // verify_proof()
+        self.resetRootHash(newRootHash.clone());
+        match op {
+            Op::Delete => return Ok(()),
+            Op::Put(v) => v,
+        };
+
+        let mut newValue = verify_proof(newProof.as_slice(), &[key.clone()], newRootHash).unwrap()[0].unwrap();
+        self.cache.insert(*key, newValue);
         Ok(())
     }
 
-    fn verify() -> Result<bool, &'static str>{
-        Ok(true)
-    }
-
-    pub fn get(&self, key: &KeyType, nonce: &Bytes) -> Option<(ValueType, sgx_ec256_signature_t)>{
+    pub fn get(&self, rootHash: &Hash, key: &KeyType, nonce: &Vec<u8>) -> Option<(ValueType, sgx_ec256_signature_t)>{
+        if rootHash != self.rootHash.as_ref().unwrap() {
+            return None;
+        }
         match self.cache.get(key) {
             Some(value) => Some((value.to_vec(), self.sign(value.to_vec(), nonce))),
-            None => None
+            None => None,
         }
     }
 
-    fn sign(&self, value: ValueType, nonce: &Bytes) -> sgx_ec256_signature_t {
+    fn sign(&self, value: ValueType, nonce: &Vec<u8>) -> sgx_ec256_signature_t {
         let mut data = value;
         data.extend_from_slice(nonce);
         ecdsa_sign_slice(&data[..])
@@ -97,11 +113,11 @@ lazy_static! {
 pub extern "C" fn ecall_get(key_ptr: *mut u8, key_len: usize,
                     nonce_ptr: *mut u8, nonce_len: usize,
                     value_ptr: *mut u8, value_len: &mut usize,
-                    sig: &mut sgx_ec256_signature_t) -> u8
+                    root_hash: &Hash, sig: &mut sgx_ec256_signature_t) -> u8
 {
     let key = unsafe { slice::from_raw_parts(key_ptr, key_len) };
     let nonce = unsafe { slice::from_raw_parts(nonce_ptr, nonce_len) };
-    let res = INTEE.read().unwrap().get(&key.to_vec(), &nonce.to_vec());
+    let res = INTEE.read().unwrap().get(root_hash, &key.to_vec(), &nonce.to_vec());
     match res {
         Some((v, b)) => {
             *value_len = v.len();
@@ -116,7 +132,7 @@ pub extern "C" fn ecall_get(key_ptr: *mut u8, key_len: usize,
 
 #[no_mangle]
 pub extern "C" fn ecall_update(key_ptr: *mut u8, key_len: usize,
-                        op: u8, value: *mut u8, newRootHash: &Hash,
+                        op: u8, value: *mut u8, new_root_hash: &Hash,
                         oproof_ptr: *mut u8, oproof_len: usize,
                         nproof_ptr: *mut u8, nproof_len: usize,) -> u8
 {
@@ -129,8 +145,8 @@ pub extern "C" fn ecall_update(key_ptr: *mut u8, key_len: usize,
         1 => Op::Delete,
         _ => panic!("invalid op num"),
     };
-    Box::into_raw(value); 
-    let res = INTEE.write().unwrap().update(&key.to_vec(), op, newRootHash, oproof.to_vec(), nproof.to_vec());
+    Box::into_raw(value);
+    let res = INTEE.write().unwrap().update(&key.to_vec(), op, new_root_hash.clone(), nproof.to_vec());
     match res {
         Ok(()) => 1,
         _ => 0,

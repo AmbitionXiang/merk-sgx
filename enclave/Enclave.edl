@@ -33,9 +33,9 @@ enclave {
         public uint8_t ecall_get([in, count=key_len] uint8_t* key_ptr, size_t key_len, 
                 [in, count=nonce_len] uint8_t* nonce_ptr, size_t nonce_len, 
                 [user_check] uint8_t* value_ptr, [user_check] size_t* value_len,
-                [out] sgx_ec256_signature_t* sig);  
+                [in] uint8_t root_hash[20], [out] sgx_ec256_signature_t* sig);  
         public uint8_t ecall_update([in, count=key_len] uint8_t* key_ptr, size_t key_len, 
-                uint8_t op, [in] uint8_t hash[20],
+                uint8_t op, [in] uint8_t new_root_hash[20],
                 [in, count=oproof_len] uint8_t* oproof_ptr, size_t oproof_len,
                 [in, count=nproof_len] uint8_t* nproof_ptr, size_t nproof_len);
 
